@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LISTS_DIR="${ROOT_DIR}/lists"
+
+usage() {
+  cat <<USG
+pf-lists - Gestiona listas (whitelist/blacklist) IPv4/IPv6 con timestamps (CSV)
+
+Uso:
+  pf-lists add    <whitelist|blacklist> <ipv4|ipv6> <ip_or_cidr> <label> [--ttl <Nh|Nm|Nd>] [--comment "texto"]
+  pf-lists remove <whitelist|blacklist> <ipv4|ipv6> <ip_or_cidr>
+  pf-lists show   <whitelist|blacklist> <ipv4|ipv6>
+  pf-lists purge  <whitelist|blacklist> <ipv4|ipv6>   # elimina filas expiradas (expires_at < ahora)
+  pf-lists help
+
+Notas:
+- CSV: ip_or_cidr,label,added_at,expires_at,comment (UTC ISO8601)
+- --ttl soporta sufijos: h=horas, d=días, m=meses (aprox 30d). Ej: 12h, 7d, 1m
+USG
+}
+
+iso_now() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+compute_expiry() {
+  local ttl="$1"
+  # Acepta 12h, 7d, 1m -> se mapea a date -d
+  if [[ -z "$ttl" ]]; then
+    echo ""
+    return 0
+  fi
+  local num="${ttl::-1}"
+  local suf="${ttl: -1}"
+  local spec=""
+  case "$suf" in
+    h) spec="+${num} hours" ;;
+    d) spec="+${num} days" ;;
+    m) spec="+${num} months" ;;
+    *) echo "TTL inválido: $ttl (usa Nh, Nd o Nm)" >&2; exit 1 ;;
+  esac
+  date -u -d "$spec" +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+csv_path() {
+  local kind="$1" fam="$2"
+  echo "${LISTS_DIR}/${kind}/${fam}/list.csv"
+}
+
+ensure_header() {
+  local f="$1"
+  if [[ ! -f "$f" ]]; then
+    mkdir -p "$(dirname "$f")"
+    printf "ip_or_cidr,label,added_at,expires_at,comment\n" > "$f"
+  fi
+}
+
+sanitize_comment() {
+  # Evita comas que rompan CSV: las sustituimos por ';'
+  echo "${1:-}" | sed 's/,/;/g'
+}
+
+cmd_add() {
+  local kind="$1" fam="$2" ipcidr="$3" label="$4"; shift 4 || true
+  local ttl="" comment=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl) ttl="$2"; shift 2 ;;
+      --comment) comment="$2"; shift 2 ;;
+      *) echo "Argumento desconocido: $1"; exit 1 ;;
+    esac
+  done
+
+  local file; file="$(csv_path "$kind" "$fam")"
+  ensure_header "$file"
+
+  # Evitar duplicados exactos por ip_or_cidr
+  if awk -F, -v ip="$ipcidr" 'NR>1 && $1==ip {found=1} END{exit !found}' "$file"; then
+    echo "Ya existe ${ipcidr} en ${kind}/${fam}. No se duplica."
+    exit 0
+  fi
+
+  local now; now="$(iso_now)"
+  local exp; exp="$(compute_expiry "$ttl")"
+  local cmt; cmt="$(sanitize_comment "$comment")"
+
+  printf "%s,%s,%s,%s,%s\n" "$ipcidr" "$label" "$now" "$exp" "$cmt" >> "$file"
+
+  echo "Agregado: $ipcidr ($label) -> $file"
+  echo "added_at=$now expires_at=${exp:-<none>}"
+}
+
+cmd_remove() {
+  local kind="$1" fam="$2" ipcidr="$3"
+  local file; file="$(csv_path "$kind" "$fam")"
+  [[ -f "$file" ]] || { echo "No existe $file"; exit 1; }
+
+  local tmp; tmp="$(mktemp)"
+  # Mantener cabecera; eliminar filas cuyo $1==ipcidr
+  awk -F, -v ip="$ipcidr" 'NR==1{print; next} $1!=ip' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  echo "Eliminado (si existía): $ipcidr de $kind/$fam"
+}
+
+cmd_show() {
+  local kind="$1" fam="$2"
+  local file; file="$(csv_path "$kind" "$fam")"
+  [[ -f "$file" ]] || { echo "No existe $file"; exit 1; }
+  column -s, -t "$file" | less -FX
+}
+
+cmd_purge() {
+  local kind="$1" fam="$2"
+  local file; file="$(csv_path "$kind" "$fam")"
+  [[ -f "$file" ]] || { echo "No existe $file"; exit 1; }
+
+  local now; now="$(iso_now)"
+  local tmp; tmp="$(mktemp)"
+  awk -F, -v now="$now" '
+    NR==1 {print; next}
+    # Mantener si expires_at vacío o >= ahora
+    {
+      if ($4 == "" || $4 >= now) print;
+    }' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  echo "Purgado expirados en $kind/$fam (ahora=$now)"
+}
+
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    add)
+      [[ $# -ge 5 ]] || { usage; exit 1; }
+      cmd_add "$2" "$3" "$4" "$5" "${@:6}"
+      ;;
+    remove)
+      [[ $# -eq 4 ]] || { usage; exit 1; }
+      cmd_remove "$2" "$3" "$4"
+      ;;
+    show)
+      [[ $# -eq 3 ]] || { usage; exit 1; }
+      cmd_show "$2" "$3"
+      ;;
+    purge)
+      [[ $# -eq 3 ]] || { usage; exit 1; }
+      cmd_purge "$2" "$3"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      echo "Comando no reconocido: $cmd"; usage; exit 1 ;;
+  esac
+}
+main "$@"
